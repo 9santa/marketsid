@@ -85,8 +85,7 @@ sequences = (
     interactions.sort(
         [
             "user_idx",
-            "timestamp",
-            "item_idx",
+            "position",  # Preserve the order used to assign train/valid/test
         ]
     )
     .group_by(
