@@ -6,13 +6,17 @@ import torch
 
 from sentence_transformers import SentenceTransformer
 
+from src.data.embedding_cache import (
+    ENCODER_CONFIG,
+    EmbeddingCacheError,
+    embedding_metadata,
+    load_embedding_cache,
+    save_embedding_cache,
+)
 
 DATA_DIR = Path("data/processed")
 
-MODEL_NAME = "BAAI/bge-small-en-v1.5"
-
 BATCH_SIZE = 256
-MAX_SEQ_LENGTH = 512
 
 
 catalog = pl.read_parquet(DATA_DIR / "catalog_model.parquet").sort("item_idx")
@@ -42,36 +46,34 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print("Device:", device)
 
 
-model = SentenceTransformer(
-    model_name_or_path=MODEL_NAME,
-    device=device,
-)
-
-model.max_seq_length = MAX_SEQ_LENGTH
-
-print("Embedding dimension:", model.get_embedding_dimension())
-
-print("Max sequence length:", model.max_seq_length)
-
-
 # ============================================================
 # ENCODE
 # ============================================================
 
 embedding_path = DATA_DIR / "item_text_embeddings.npy"
+metadata = embedding_metadata(catalog)
 
-if embedding_path.exists():
-    print("Embeddings already exist. Loading from disk...")
-    embeddings = np.load(embedding_path)
-else:
+try:
+    embeddings = load_embedding_cache(embedding_path, metadata)
+    print("Loaded validated embeddings from disk.")
+except EmbeddingCacheError as error:
+    print(error)
     print("Encoding items...")
+    model = SentenceTransformer(
+        model_name_or_path=ENCODER_CONFIG["model_name"],
+        revision=ENCODER_CONFIG["revision"],
+        device=device,
+    )
+    model.max_seq_length = ENCODER_CONFIG["max_seq_length"]
     embeddings = model.encode(
         texts,
         batch_size=BATCH_SIZE,
         show_progress_bar=True,
         convert_to_numpy=True,
-        normalize_embeddings=True,
+        normalize_embeddings=ENCODER_CONFIG["normalize_embeddings"],
     )
+    save_embedding_cache(embedding_path, embeddings, metadata)
+    print("Saved embeddings and validation metadata.")
 
 print("\nEmbeddings:")
 print("shape:", embeddings.shape)
@@ -86,18 +88,6 @@ norms = np.linalg.norm(embeddings, axis=1)
 
 print("Norm mean:", norms.mean())
 print("Norm std:", norms.std())
-
-
-# ============================================================
-# SAVE
-# ============================================================
-
-np.save(
-    DATA_DIR / "item_text_embeddings.npy",
-    embeddings.astype(np.float32),
-)
-
-print("\nSaved embeddings.")
 
 
 # ============================================================
