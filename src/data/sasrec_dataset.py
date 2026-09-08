@@ -1,25 +1,13 @@
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 
 class SASRecTrainDataset(Dataset):
-    """
-    One training example = one user's train sequence.
+    """One example per training prefix, with one next item and 64 negatives.
 
-    Example:
-        history = [A, B, C, D, E]
-
-        input    = [A, B, C, D]
-        positive = [B, C, D, E]
-        negative = [X, Y, Z, W]
-
-    All sequences are left-padded with 0.
-
-    During training, the model will compute scores for all positive and negative items (per position)
-    and apply a pairwise loss to push the positive score higher than negatives.
-    The random prefix ensures the model learns to predict the next item given any prefix of the user’s behaviour.
+    The final two interactions are held out. Inputs are left-padded with 0
+    and retain at most max_len items. Negatives are resampled each epoch.
     """
 
     def __init__(
@@ -31,53 +19,58 @@ class SASRecTrainDataset(Dataset):
     ):
         self.histories = [np.asarray(seq[:-2], dtype=np.int64) for seq in sequences]
 
+        # Map example indices to users without storing copies of every prefix.
+        self.prefix_offsets = np.cumsum(
+            [0] + [max(len(history) - 1, 0) for history in self.histories],
+            dtype=np.int64,
+        )
+
         self.warm_item_ids = np.asarray(warm_item_ids, dtype=np.int64)
 
         self.max_len = max_len
         self.seed = seed
         self.epoch = 0
 
-        self.histories = [h for h in self.histories if len(h) >= 2]
-
     def __len__(self):
-        return len(self.histories)
+        return int(self.prefix_offsets[-1])
 
     def set_epoch(self, epoch):
         self.epoch = epoch
 
     def __getitem__(self, idx):
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        user_idx = int(np.searchsorted(self.prefix_offsets, idx, side="right") - 1)
+        target_position = int(idx - self.prefix_offsets[user_idx] + 1)
+
+        history = self.histories[user_idx]
+
         rng = np.random.default_rng(self.seed + self.epoch * 1_000_003 + idx)
 
-        history = self.histories[idx]
+        prefix = history[:target_position]
+        target = int(history[target_position])
 
-        window = history[-(self.max_len + 1) :]
-
-        input_items = window[:-1]  # all but last -> the context
-        positive_items = window[
-            1:
-        ]  # all but first -> the next items to predict for each subsequence
-
-        # Negatives - only train catalog, one per positive
-        negative_items = rng.choice(
+        negatives = rng.choice(
             self.warm_item_ids,
-            size=len(positive_items),
+            size=64,
             replace=True,
         )
 
         # Remove bad-negatives - items that the user has actually interacted with in the training data
-        bad = np.isin(negative_items, history)
+        bad = np.isin(negatives, history)
         while bad.any():
-            negative_items[bad] = rng.choice(
+            negatives[bad] = rng.choice(
                 self.warm_item_ids,
-                size=bad.sum(),
+                size=int(bad.sum()),
                 replace=True,
             )
-            bad = np.isin(negative_items, history)
+            bad = np.isin(negatives, history)
 
         return (
-            torch.from_numpy(_pad_left(input_items, self.max_len)),
-            torch.from_numpy(_pad_left(positive_items, self.max_len)),
-            torch.from_numpy(_pad_left(negative_items, self.max_len)),
+            torch.from_numpy(_pad_left(prefix, self.max_len)),
+            torch.tensor(target, dtype=torch.long),
+            torch.from_numpy(negatives.astype(np.int64)),
         )
 
 

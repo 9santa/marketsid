@@ -8,7 +8,6 @@ import time
 import numpy as np
 import polars as pl
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.data.sasrec_dataset import (
@@ -25,20 +24,20 @@ from src.models.sasrec import SASRec, sasrec_loss
 
 DATA_DIR = Path("data/processed")
 CHECKPOINT_DIR = Path("checkpoints")
-CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
 CONFIG = {
     "max_len": 50,
     "d_model": 64,
-    "n_heads": 8,
-    "n_layers": 4,
+    "n_heads": 4,
+    "n_layers": 3,
     "dropout": 0.2,
     "batch_size": 1024,
     "lr": 1e-3,
     "weight_decay": 1e-4,
-    "epochs": 20,
+    "epochs": 50,
     "patience": 3,
     "seed": 42,
+    "training_strategy": "all_prefixes",
 }
 
 
@@ -57,73 +56,6 @@ def save_history(history, path):
         encoding="utf-8",
     )
     temporary_path.replace(path)
-
-
-set_seed(CONFIG["seed"])
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-print("Device:", device)
-
-
-interactions = pl.read_parquet(DATA_DIR / "interactions_model.parquet")
-
-sequences_df = pl.read_parquet(DATA_DIR / "user_sequences.parquet").sort("user_idx")
-
-sequences = sequences_df["item_sequence"].to_list()
-
-num_items = interactions["item_idx"].max()
-
-warm_item_ids = (
-    interactions.filter(pl.col("split") == "train")["item_idx"]
-    .unique()
-    .sort()
-    .to_numpy()
-)
-
-print("Users:", len(sequences))
-print("All items:", num_items)
-print("Train items:", len(warm_item_ids))
-
-
-train_dataset = SASRecTrainDataset(
-    sequences=sequences,
-    warm_item_ids=warm_item_ids,
-    max_len=CONFIG["max_len"],
-    seed=CONFIG["seed"],
-)
-
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=CONFIG["batch_size"],
-    shuffle=True,
-    num_workers=0,
-    pin_memory=(device.type == "cuda"),
-)
-
-print("Training examples:", len(train_dataset))
-print("Batches:", len(train_loader))
-
-
-model = SASRec(
-    num_items=num_items,
-    max_len=CONFIG["max_len"],
-    d_model=CONFIG["d_model"],
-    n_heads=CONFIG["n_heads"],
-    n_layers=CONFIG["n_layers"],
-    dropout=CONFIG["dropout"],
-).to(device)
-
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=CONFIG["lr"],
-    weight_decay=CONFIG["weight_decay"],
-)
-
-scaler = torch.amp.GradScaler(
-    "cuda",
-    enabled=(device.type == "cuda"),
-)
 
 
 def train_one_epoch(
@@ -181,7 +113,7 @@ def train_one_epoch(
 
 def build_eval_records(interactions: pl.DataFrame, split: str):
     rows = (
-        interactions.sort(["user_idx", "timestamp", "item_idx"])
+        interactions.sort(["user_idx", "position"])
         .group_by("user_idx", maintain_order=True)
         .agg(
             pl.col("item_idx").alias("items"),
@@ -226,11 +158,15 @@ def evaluate(
 ):
     model.eval()
 
+    warm_item_ids = np.asarray(warm_item_ids, dtype=np.int64)
     candidate_ids = torch.tensor(
         warm_item_ids,
         dtype=torch.long,
         device=device,
     )
+
+    candidate_pos = np.full(model.num_items + 1, -1, dtype=np.int64)
+    candidate_pos[warm_item_ids] = np.arange(len(warm_item_ids))
 
     max_k = max(k_values)
 
@@ -257,19 +193,20 @@ def evaluate(
         if not torch.isfinite(scores).all():
             raise RuntimeError("Non-finite recommendation scores during evaluation")
 
-        # Exclude already-seen items
+        # Map seen IDs to candidate columns once, then mask the whole batch.
+        rows = []
+        cols = []
         for row_idx, record in enumerate(batch):
-            seen = set(record["history"])
+            positions = candidate_pos[np.asarray(record["history"], dtype=np.int64)]
+            positions = positions[positions >= 0]
+            rows.extend([row_idx] * len(positions))
+            cols.extend(positions.tolist())
 
-            mask = torch.isin(
-                candidate_ids,
-                torch.as_tensor(
-                    list(seen),
-                    device=device,
-                ),
-            )
-
-            scores[row_idx, mask] = -torch.inf
+        if rows:
+            scores[
+                torch.as_tensor(rows, device=device),
+                torch.as_tensor(cols, device=device),
+            ] = -torch.inf
 
         topk_positions = torch.topk(
             scores,
@@ -323,132 +260,202 @@ def evaluate(
     return result
 
 
-valid_records = build_eval_records(interactions, split="valid")
+def main():
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    set_seed(CONFIG["seed"])
 
-test_records = build_eval_records(interactions, split="test")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-best_metric = -1.0
-best_epoch = -1
-patience_counter = 0
+    print("Device:", device)
 
-started_at = datetime.now(timezone.utc)
-run_id = started_at.strftime("%Y%m%dT%H%M%S%fZ")
-history_path = CHECKPOINT_DIR / f"sasrec_history_{run_id}.json"
-history = {
-    "run_id": run_id,
-    "started_at": started_at.isoformat(),
-    "config": dict(CONFIG),
-    "device": str(device),
-    "num_users": len(sequences),
-    "num_items": int(num_items),
-    "num_train_items": len(warm_item_ids),
-    "selection_metric": "valid.warm.recall@20",
-    "best_epoch": None,
-    "best_metric": None,
-    "stopped_early": False,
-    "epochs": [],
-    "test_metrics": None,
-}
-save_history(history, history_path)
-print("Training history:", history_path)
+    interactions = pl.read_parquet(DATA_DIR / "interactions_model.parquet")
 
-for epoch in range(1, CONFIG["epochs"] + 1):
-    epoch_started = time.perf_counter()
-    train_dataset.set_epoch(epoch)
+    sequences_df = pl.read_parquet(DATA_DIR / "user_sequences.parquet").sort("user_idx")
 
-    train_loss = train_one_epoch(
-        model,
-        train_loader,
-        optimizer,
-        scaler,
-        device,
+    sequences = sequences_df["item_sequence"].to_list()
+
+    num_items = interactions["item_idx"].max()
+
+    warm_item_ids = (
+        interactions.filter(pl.col("split") == "train")["item_idx"]
+        .unique()
+        .sort()
+        .to_numpy()
     )
 
-    valid_metrics = evaluate(
+    print("Users:", len(sequences))
+    print("All items:", num_items)
+    print("Train items:", len(warm_item_ids))
+
+    train_dataset = SASRecTrainDataset(
+        sequences=sequences,
+        warm_item_ids=warm_item_ids,
+        max_len=CONFIG["max_len"],
+        seed=CONFIG["seed"],
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=CONFIG["batch_size"],
+        shuffle=True,
+        num_workers=0,
+        pin_memory=(device.type == "cuda"),
+    )
+
+    print("Training examples:", len(train_dataset))
+    print("Batches:", len(train_loader))
+
+    model = SASRec(
+        num_items=num_items,
+        max_len=CONFIG["max_len"],
+        d_model=CONFIG["d_model"],
+        n_heads=CONFIG["n_heads"],
+        n_layers=CONFIG["n_layers"],
+        dropout=CONFIG["dropout"],
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CONFIG["lr"],
+        weight_decay=CONFIG["weight_decay"],
+    )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=(device.type == "cuda"),
+    )
+
+    valid_records = build_eval_records(interactions, split="valid")
+
+    test_records = build_eval_records(interactions, split="test")
+
+    best_metric = -1.0
+    best_epoch = -1
+    patience_counter = 0
+
+    started_at = datetime.now(timezone.utc)
+    run_id = started_at.strftime("%Y%m%dT%H%M%S%fZ")
+    history_path = CHECKPOINT_DIR / f"sasrec_history_{run_id}.json"
+    history = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "config": dict(CONFIG),
+        "device": str(device),
+        "num_users": len(sequences),
+        "num_items": int(num_items),
+        "num_train_items": len(warm_item_ids),
+        "num_train_examples": len(train_dataset),
+        "selection_metric": "valid.warm.recall@20",
+        "best_epoch": None,
+        "best_metric": None,
+        "stopped_early": False,
+        "epochs": [],
+        "test_metrics": None,
+    }
+    save_history(history, history_path)
+    print("Training history:", history_path)
+
+    for epoch in range(1, CONFIG["epochs"] + 1):
+        epoch_started = time.perf_counter()
+        train_dataset.set_epoch(epoch)
+
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+        )
+
+        valid_metrics = evaluate(
+            model,
+            valid_records,
+            warm_item_ids,
+            max_len=CONFIG["max_len"],
+            device=device,
+        )
+
+        metric = valid_metrics["warm"]["recall@20"]
+
+        print(
+            f"Epoch {epoch:02d} | "
+            f"loss={train_loss:.4f} | "
+            f"val R@20={metric:.6f} | "
+            f"val NDCG@20="
+            f"{valid_metrics['warm']['ndcg@20']:.6f}"
+        )
+
+        if metric > best_metric:
+            best_metric = metric
+            best_epoch = epoch
+            patience_counter = 0
+
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": CONFIG,
+                    "epoch": epoch,
+                    "best_metric": best_metric,
+                    "history_file": str(history_path),
+                },
+                CHECKPOINT_DIR / "sasrec_best.pt",
+            )
+
+            print("Saved best checkpoint")
+
+        else:
+            patience_counter += 1
+
+        history["epochs"].append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "duration_seconds": time.perf_counter() - epoch_started,
+                "valid_metrics": valid_metrics,
+                "is_best": best_epoch == epoch,
+            }
+        )
+        history["best_epoch"] = best_epoch
+        history["best_metric"] = best_metric
+        history["stopped_early"] = patience_counter >= CONFIG["patience"]
+        save_history(history, history_path)
+
+        if history["stopped_early"]:
+            print("Early stopping")
+            break
+
+    checkpoint = torch.load(
+        CHECKPOINT_DIR / "sasrec_best.pt",
+        map_location=device,
+        weights_only=False,
+    )
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+
+    test_metrics = evaluate(
         model,
-        valid_records,
+        test_records,
         warm_item_ids,
         max_len=CONFIG["max_len"],
         device=device,
     )
 
-    metric = valid_metrics["warm"]["recall@20"]
-
-    print(
-        f"Epoch {epoch:02d} | "
-        f"loss={train_loss:.4f} | "
-        f"val R@20={metric:.6f} | "
-        f"val NDCG@20="
-        f"{valid_metrics['warm']['ndcg@20']:.6f}"
-    )
-
-    if metric > best_metric:
-        best_metric = metric
-        best_epoch = epoch
-        patience_counter = 0
-
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "config": CONFIG,
-                "epoch": epoch,
-                "best_metric": best_metric,
-                "history_file": str(history_path),
-            },
-            CHECKPOINT_DIR / "sasrec_best.pt",
-        )
-
-        print("Saved best checkpoint")
-
-    else:
-        patience_counter += 1
-
-    history["epochs"].append(
-        {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "learning_rate": optimizer.param_groups[0]["lr"],
-            "duration_seconds": time.perf_counter() - epoch_started,
-            "valid_metrics": valid_metrics,
-            "is_best": best_epoch == epoch,
-        }
-    )
-    history["best_epoch"] = best_epoch
-    history["best_metric"] = best_metric
-    history["stopped_early"] = patience_counter >= CONFIG["patience"]
+    history["test_metrics"] = test_metrics
+    history["finished_at"] = datetime.now(timezone.utc).isoformat()
     save_history(history, history_path)
 
-    if history["stopped_early"]:
-        print("Early stopping")
-        break
+    print("\n=== TEST RESULTS ===")
+    print("Best epoch:", best_epoch)
+
+    for group, values in test_metrics.items():
+        print(f"\n[{group}] n={values['n']}")
+
+        for k in (10, 20, 50):
+            print(
+                f"R@{k}={values[f'recall@{k}']:.6f} NDCG@{k}={values[f'ndcg@{k}']:.6f}"
+            )
 
 
-checkpoint = torch.load(
-    CHECKPOINT_DIR / "sasrec_best.pt",
-    map_location=device,
-    weights_only=False,
-)
-
-model.load_state_dict(checkpoint["model_state_dict"])
-
-test_metrics = evaluate(
-    model,
-    test_records,
-    warm_item_ids,
-    max_len=CONFIG["max_len"],
-    device=device,
-)
-
-history["test_metrics"] = test_metrics
-history["finished_at"] = datetime.now(timezone.utc).isoformat()
-save_history(history, history_path)
-
-
-print("\n=== TEST RESULTS ===")
-print("Best epoch:", best_epoch)
-
-for group, values in test_metrics.items():
-    print(f"\n[{group}] n={values['n']}")
-
-    for k in (10, 20, 50):
-        print(f"R@{k}={values[f'recall@{k}']:.6f} NDCG@{k}={values[f'ndcg@{k}']:.6f}")
+if __name__ == "__main__":
+    main()

@@ -4,9 +4,10 @@ import torch.nn.functional as F
 
 
 def sasrec_loss(pos_logits, neg_logits, positive_items):
+    """Binary logistic loss, balancing each positive against its negatives."""
     mask = positive_items.ne(0)
 
-    loss = F.softplus(-pos_logits) + F.softplus(neg_logits)
+    loss = F.softplus(-pos_logits) + F.softplus(neg_logits).mean(dim=-1)
 
     return loss[mask].mean()
 
@@ -182,15 +183,16 @@ class SASRec(nn.Module):
         positive_items,
         negative_items,
     ):
-        hidden = self.encode(item_seq)
+        """Score next items: inputs [B, L], positives [B], negatives [B, N]."""
+        user_repr = self.encode(item_seq)[:, -1, :]
 
         positive_embeddings = self.item_embedding(positive_items)
 
         negative_embeddings = self.item_embedding(negative_items)
 
-        positive_logits = (hidden * positive_embeddings).sum(dim=-1)
+        positive_logits = (user_repr * positive_embeddings).sum(dim=-1)
 
-        negative_logits = (hidden * negative_embeddings).sum(dim=-1)
+        negative_logits = (user_repr.unsqueeze(1) * negative_embeddings).sum(dim=-1)
 
         return (positive_logits, negative_logits)
 
@@ -209,7 +211,7 @@ class SASRec(nn.Module):
         hidden = self.encode(item_seq)
 
         # Last position - actual last interaction
-        user_repr = hidden[:, -1, :]  # [B, 1, L]
+        user_repr = hidden[:, -1, :]
 
         item_repr = self.item_embedding(candidate_ids)
 
