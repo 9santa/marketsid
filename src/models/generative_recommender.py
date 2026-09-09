@@ -299,6 +299,72 @@ class GenerativeRecommender(nn.Module):
 
         return logits
 
+    @torch.no_grad()
+    def next_token_logits(
+        self,
+        memory: torch.Tensor,
+        memory_padding_mask,
+        prefix: list[int],
+    ):
+        """
+        prefix: list[int] of length 0..L-1
+
+        returns: logits for next SID-level token
+        """
+
+        level = len(prefix)
+
+        if level >= self.num_levels:
+            raise ValueError("SID already complete")
+
+        batch_size = memory.shape[0]
+
+        decoder_input = torch.zeros(
+            batch_size,
+            level + 1,
+            self.d_model,
+            device=memory.device,
+        )
+
+        decoder_input[:, 0] = self.bos_embedding
+
+        for position, token in enumerate(prefix, start=1):
+            decoder_input[:, position] = self.sid_embeddings[position - 1](
+                torch.full(
+                    size=(batch_size,),
+                    fill_value=int(token),
+                    dtype=torch.long,
+                    device=memory.device,
+                )
+            )
+
+        positions = torch.arange(level + 1, device=memory.device).unsqueeze(0)
+
+        decoder_input = decoder_input + self.decoder_position_embedding(positions)
+
+        length = level + 1
+
+        causal_mask = torch.triu(
+            torch.ones(
+                length,
+                length,
+                dtype=torch.bool,
+                device=memory.device,
+            ),
+            diagonal=1,
+        )
+
+        hidden = self.decoder(
+            tgt=decoder_input,
+            memory=memory,
+            tgt_mask=causal_mask,
+            memory_key_padding_mask=memory_padding_mask,
+        )
+
+        hidden = self.decoder_norm(hidden)
+
+        return self.output_heads[level](hidden[:, -1, :])
+
     def forward(
         self,
         item_seq,
