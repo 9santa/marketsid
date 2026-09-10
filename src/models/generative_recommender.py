@@ -311,43 +311,31 @@ class GenerativeRecommender(nn.Module):
 
         returns: logits for next SID-level token
         """
+        batch_size = memory.shape[0]
+        prefix = torch.as_tensor(prefix, dtype=torch.long, device=memory.device)
 
-        level = len(prefix)
+        if prefix.ndim == 1:
+            prefix = prefix.unsqueeze(0).expand(batch_size, -1)
+
+        level = prefix.shape[1]
 
         if level >= self.num_levels:
             raise ValueError("SID already complete")
 
-        batch_size = memory.shape[0]
-
-        decoder_input = torch.zeros(
-            batch_size,
-            level + 1,
-            self.d_model,
-            device=memory.device,
-        )
-
-        decoder_input[:, 0] = self.bos_embedding
-
-        for position, token in enumerate(prefix, start=1):
-            decoder_input[:, position] = self.sid_embeddings[position - 1](
-                torch.full(
-                    size=(batch_size,),
-                    fill_value=int(token),
-                    dtype=torch.long,
-                    device=memory.device,
-                )
+        inputs = [self.bos_embedding.expand(batch_size, 1, -1)]
+        for position in range(level):
+            inputs.append(
+                self.sid_embeddings[position](prefix[:, position]).unsqueeze(1)
             )
 
-        positions = torch.arange(level + 1, device=memory.device).unsqueeze(0)
-
+        decoder_input = torch.cat(inputs, dim=1)
+        positions = torch.arange(level + 1, device=memory.device)
         decoder_input = decoder_input + self.decoder_position_embedding(positions)
-
-        length = level + 1
 
         causal_mask = torch.triu(
             torch.ones(
-                length,
-                length,
+                level + 1,
+                level + 1,
                 dtype=torch.bool,
                 device=memory.device,
             ),
@@ -361,9 +349,9 @@ class GenerativeRecommender(nn.Module):
             memory_key_padding_mask=memory_padding_mask,
         )
 
-        hidden = self.decoder_norm(hidden)
+        hidden = self.decoder_norm(hidden[:, -1])
 
-        return self.output_heads[level](hidden[:, -1, :])
+        return self.output_heads[level](hidden)
 
     def forward(
         self,

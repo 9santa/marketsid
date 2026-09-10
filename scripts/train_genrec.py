@@ -1,6 +1,8 @@
 from pathlib import Path
+from datetime import datetime, timezone
 import json
 import random
+import time
 
 import numpy as np
 import polars as pl
@@ -32,8 +34,8 @@ CONFIG = {
     "batch_size": 2048,
     "lr": 3e-4,
     "weight_decay": 1e-4,
-    "epochs": 20,
-    "patience": 3,
+    "epochs": 50,
+    "patience": 5,
     "seed": 42,
 }
 
@@ -46,6 +48,16 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def save_history(history, path):
+    # Replace the previous snapshot only after the new JSON is fully written.
+    temporary_path = path.with_suffix(".json.tmp")
+    temporary_path.write_text(
+        json.dumps(history, indent=2, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
 
 
 # ============================================================
@@ -231,6 +243,9 @@ def main():
 
     num_items = len(catalog)
 
+    print("Users:", len(sequences))
+    print("Items:", num_items)
+
     # row 0 = PAD item
     item_sids = np.zeros(
         (
@@ -272,6 +287,7 @@ def main():
         "Training examples:",
         len(train_dataset),
     )
+    print("Batches:", len(train_loader))
 
     # ============================================================
     # MODEL
@@ -299,12 +315,35 @@ def main():
     )
 
     best_loss = float("inf")
+    best_epoch = -1
     patience_counter = 0
+
+    started_at = datetime.now(timezone.utc)
+    run_id = started_at.strftime("%Y%m%dT%H%M%S%fZ")
+    history_path = CHECKPOINT_DIR / f"genrec_history_{run_id}.json"
+    history = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "config": dict(CONFIG),
+        "device": str(device),
+        "vocab_sizes": vocab_sizes,
+        "num_users": len(sequences),
+        "num_items": num_items,
+        "num_train_examples": len(train_dataset),
+        "selection_metric": "valid.loss",
+        "best_epoch": None,
+        "best_metric": None,
+        "stopped_early": False,
+        "epochs": [],
+    }
+    save_history(history, history_path)
+    print("Training history:", history_path)
 
     for epoch in range(
         1,
         CONFIG["epochs"] + 1,
     ):
+        epoch_started = time.perf_counter()
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -329,6 +368,7 @@ def main():
 
         if val["loss"] < best_loss:
             best_loss = val["loss"]
+            best_epoch = epoch
             patience_counter = 0
 
             torch.save(
@@ -338,6 +378,7 @@ def main():
                     "vocab_sizes": vocab_sizes,
                     "epoch": epoch,
                     "val_loss": best_loss,
+                    "history_file": str(history_path),
                 },
                 CHECKPOINT_DIR / "genrec_content_best.pt",
             )
@@ -347,9 +388,28 @@ def main():
         else:
             patience_counter += 1
 
-            if patience_counter >= CONFIG["patience"]:
-                print("Early stopping")
-                break
+        history["epochs"].append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "duration_seconds": time.perf_counter() - epoch_started,
+                "valid_metrics": val,
+                "is_best": best_epoch == epoch,
+            }
+        )
+        history["best_epoch"] = best_epoch
+        history["best_metric"] = best_loss
+        history["stopped_early"] = patience_counter >= CONFIG["patience"]
+        save_history(history, history_path)
+
+        if history["stopped_early"]:
+            print("Early stopping")
+            break
+
+    history["finished_at"] = datetime.now(timezone.utc).isoformat()
+    save_history(history, history_path)
+    print("\nBest epoch:", best_epoch)
 
 
 if __name__ == "__main__":
