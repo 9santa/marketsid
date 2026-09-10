@@ -200,13 +200,26 @@ def main():
         parser.error("Require beam-size >= 50, batch-size > 0 and limit > 0")
 
     data_dir = Path("data/processed")
-    checkpoint_path = Path("checkpoints/genrec_content_best.pt")
+    checkpoint_path = Path("checkpoints/genrec_content_D_best.pt")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device, flush=True)
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     config = checkpoint["config"]
     vocab_sizes = checkpoint["vocab_sizes"]
+    state = checkpoint["model_state_dict"]
+    variant_config = checkpoint.get("variant_config", {})
+    embedding_mode = variant_config.get("embedding_mode", "scratch")
+    rq_codebooks = None
+    if embedding_mode == "rq_init":
+        rq_codebooks = [
+            state[f"sid_embeddings.{level}.weight"]
+            for level in range(len(vocab_sizes) - 1)
+        ]
+    elif embedding_mode == "rq_anchor":
+        rq_codebooks = [
+            state[f"rq_base_{level}"] for level in range(len(vocab_sizes) - 1)
+        ]
     semantic_ids = np.load(data_dir / "item_semantic_ids_content.npy")
     catalog = pl.read_parquet(
         data_dir / "catalog_model.parquet", columns=["item_idx"]
@@ -229,8 +242,11 @@ def main():
         n_encoder_layers=config["n_encoder_layers"],
         n_decoder_layers=config["n_decoder_layers"],
         dropout=config["dropout"],
+        embedding_mode=embedding_mode,
+        tie_semantic_output=variant_config.get("tie_semantic_output", False),
+        rq_codebooks=rq_codebooks,
     ).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model.load_state_dict(state)
 
     interactions = pl.read_parquet(
         data_dir / "interactions_model.parquet", columns=["item_idx", "split"]

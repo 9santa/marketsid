@@ -1,9 +1,32 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules import loss
 
 
 class GenerativeRecommender(nn.Module):
+    """
+    Semantic-ID generative recommender.
+
+    embedding_mode:
+        "scratch"
+            обычные embeddings from scratch
+
+        "rq_init"
+            semantic embeddings инициализируются
+            RQ-VAE codebook vectors и затем свободно обучаются
+
+        "rq_anchor"
+            effective embedding = frozen RQ vector + trainable delta
+
+    tie_semantic_output: weight-tying
+        если True, первые semantic output heads используют
+        те же embeddings, что и input side.
+
+    Последний SID level считается collision token и
+    всегда остаётся обычным learned embedding/head.
+    """
+
     def __init__(
         self,
         item_sids: torch.Tensor,
@@ -14,13 +37,26 @@ class GenerativeRecommender(nn.Module):
         n_encoder_layers: int = 3,
         n_decoder_layers: int = 2,
         dropout: float = 0.2,
+        embedding_mode: str = "scratch",
+        tie_semantic_output: bool = False,
+        rq_codebooks: list[torch.Tensor] | None = None,
     ):
         super().__init__()
+
+        if embedding_mode not in {
+            "scratch",
+            "rq_init",
+            "rq_anchor",
+        }:
+            raise ValueError(f"Unknown embedding_mode={embedding_mode}")
 
         self.max_len = max_len
         self.d_model = d_model
         self.num_levels = len(vocab_sizes)
+        self.num_semantic_levels = self.num_levels - 1
         self.vocab_sizes = vocab_sizes
+        self.embedding_mode = embedding_mode
+        self.tie_semantic_output = tie_semantic_output
 
         # Lookup table: ordinaty item ID -> item SID sequence
         # [num_items + 1, 4]
@@ -97,6 +133,31 @@ class GenerativeRecommender(nn.Module):
 
         self._init_weights()
 
+        # RQ initialization / anchoring
+
+        if embedding_mode in {
+            "rq_init",
+            "rq_anchor",
+        }:
+            if rq_codebooks is None:
+                raise ValueError(
+                    f"rq_codebooks required for embedding_mode={embedding_mode}"
+                )
+
+            self._install_rq_codebooks(rq_codebooks)
+
+        if tie_semantic_output:
+            self.semantic_output_biases = nn.ParameterList(
+                [
+                    nn.Parameter(torch.zeros(vocab_sizes[level]))
+                    for level in range(self.num_semantic_levels)
+                ]
+            )
+
+            for level in range(self.num_semantic_levels):
+                for parameter in self.output_heads[level].parameters():
+                    parameter.requires_grad = False
+
     def _init_weights(self):
         nn.init.normal_(
             self.bos_embedding,
@@ -118,6 +179,58 @@ class GenerativeRecommender(nn.Module):
                 embedding.weight,
                 std=0.02,
             )
+
+    def _install_rq_codebooks(self, rq_codebooks):
+        if len(rq_codebooks) != self.num_semantic_levels:
+            raise ValueError(
+                f"Expected {self.num_semantic_levels} RQ codebooks, got {len(rq_codebooks)}"
+            )
+
+        for level, codebook in enumerate(rq_codebooks):
+            codebook = codebook.detach().float().clone()
+
+            expected_shape = (self.vocab_sizes[level], self.d_model)
+
+            if tuple(codebook.shape) != expected_shape:
+                raise ValueError(
+                    f"RQ codebook {level}: {tuple(codebook.shape)} != {expected_shape}"
+                )
+
+            if self.embedding_mode == "rq_init":
+                with torch.no_grad():
+                    self.sid_embeddings[level].weight.copy_(codebook)
+
+            elif self.embedding_mode == "rq_anchor":
+                # Frozen semantic anchor
+                self.register_buffer(
+                    f"rq_base_{level}",
+                    codebook,
+                    persistent=True,
+                )
+
+                # Embedding table now means delta
+                with torch.no_grad():
+                    self.sid_embeddings[level].weight.zero_()
+
+    def embedding_weight(self, level: int):
+        if self.embedding_mode == "rq_anchor" and level < self.num_semantic_levels:
+            base = getattr(self, f"rq_base_{level}")
+
+            delta = self.sid_embeddings[level].weight
+
+            return base + delta
+
+        return self.sid_embeddings[level].weight
+
+    def embed_codes(
+        self,
+        codes: torch.Tensor,
+        level: int,
+    ):
+        return F.embedding(
+            codes,
+            self.embedding_weight(level),
+        )
 
     def embed_items(
         self,
@@ -142,10 +255,10 @@ class GenerativeRecommender(nn.Module):
             device=item_ids.device,
         )
 
-        for level, embedding in enumerate(self.sid_embeddings):
+        for level in range(self.num_levels):
             codes = sids[..., level]
 
-            result = result + embedding(codes)
+            result = result + self.embed_codes(codes, level)
 
         # Divide so variance of the sum stays roughly consistent
         result = result / (self.num_levels**0.5)
@@ -232,8 +345,8 @@ class GenerativeRecommender(nn.Module):
         for position in range(1, self.num_levels):
             prev_level = position - 1
 
-            decoder_input[:, position] = self.sid_embeddings[prev_level](
-                target_sids[:, prev_level]
+            decoder_input[:, position] = self.embed_codes(
+                target_sids[:, prev_level], prev_level
             )
 
         positions = torch.arange(
@@ -244,6 +357,24 @@ class GenerativeRecommender(nn.Module):
         decoder_input = decoder_input + self.decoder_position_embedding(positions)
 
         return decoder_input
+
+    def level_logits(
+        self,
+        hidden: torch.Tensor,
+        level: int,
+    ):
+        """
+        hidden: [B, D]
+        """
+
+        if self.tie_semantic_output and level < self.num_semantic_levels:
+            return F.linear(
+                hidden,
+                self.embedding_weight(level),
+                self.semantic_output_biases[level],
+            )
+
+        return self.output_heads[level](hidden)
 
     def decode(
         self,
@@ -293,11 +424,13 @@ class GenerativeRecommender(nn.Module):
 
         hidden = self.decoder_norm(hidden)
 
-        logits = [
-            head(hidden[:, level]) for level, head in enumerate(self.output_heads)
+        return [
+            self.level_logits(
+                hidden[:, level],
+                level,
+            )
+            for level in range(self.num_levels)
         ]
-
-        return logits
 
     @torch.no_grad()
     def next_token_logits(
@@ -325,7 +458,7 @@ class GenerativeRecommender(nn.Module):
         inputs = [self.bos_embedding.expand(batch_size, 1, -1)]
         for position in range(level):
             inputs.append(
-                self.sid_embeddings[position](prefix[:, position]).unsqueeze(1)
+                self.embed_codes(prefix[:, position], position).unsqueeze(1)
             )
 
         decoder_input = torch.cat(inputs, dim=1)
@@ -351,7 +484,63 @@ class GenerativeRecommender(nn.Module):
 
         hidden = self.decoder_norm(hidden[:, -1])
 
-        return self.output_heads[level](hidden)
+        return self.level_logits(hidden, level)
+
+    def anchor_loss(self):
+        """
+        Relative displacement from RQ-VAE geometry.
+
+        0 when embedding_mode != rq_anchor.
+
+        Normalize with scale from the source codebook,
+        so that lambda is in similar scale and more interpretable.
+        """
+
+        if self.embedding_mode != "rq_anchor":
+            return self.bos_embedding.new_zeros(())
+
+        losses = []
+
+        for level in range(self.num_semantic_levels):
+            base = getattr(self, f"rq_base_{level}")
+
+            delta = self.sid_embeddings[level].weight
+
+            delta_energy = delta.square().mean()
+
+            base_energy = base.square().mean().detach().clamp_min(1e-8)
+
+            losses.append(delta_energy / base_energy)
+
+        return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def semantic_drift(self):
+        """
+        RMS(delta) / RMS(RQ base) for D's diagnostic
+        """
+
+        if self.embedding_mode != "rq_anchor":
+            return None
+
+        results = []
+
+        for level in range(self.num_semantic_levels):
+            base = getattr(
+                self,
+                f"rq_base_{level}",
+            )
+
+            delta = self.sid_embeddings[level].weight
+
+            ratio = (
+                delta.square().mean().sqrt()
+                / base.square().mean().sqrt().clamp_min(1e-8)
+            )
+
+            results.append(float(ratio))
+
+        return results
 
     def forward(
         self,

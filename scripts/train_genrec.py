@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 import random
 import time
+import argparse
 
 import numpy as np
 import polars as pl
@@ -22,6 +23,7 @@ from src.data.genrec_dataset import (
 
 DATA_DIR = Path("data/processed")
 CHECKPOINT_DIR = Path("checkpoints")
+RQ_CHECKPOINT = CHECKPOINT_DIR / "rqvae_content_best.pt"
 
 
 CONFIG = {
@@ -60,6 +62,38 @@ def save_history(history, path):
     temporary_path.replace(path)
 
 
+def load_rq_codebooks(checkpoint_path):
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    config = checkpoint["config"]
+    state = checkpoint["model_state_dict"]
+
+    num_codebooks = config["num_codebooks"]
+
+    latent_dim = config["latent_dim"]
+
+    codebooks = []
+
+    for level in range(num_codebooks):
+        key = f"quantizer.codebooks.{level}.weight"
+
+        if key not in state:
+            raise KeyError(f"{key} not found in RQ-VAE checkpoint")
+
+        weight = state[key].detach().float().clone()
+
+        if weight.shape[1] != latent_dim:
+            raise ValueError(f"Unexpected shape {weight.shape}")
+
+        codebooks.append(weight)
+
+    return codebooks
+
+
 # ============================================================
 # TRAINING EPOCH
 # ============================================================
@@ -69,9 +103,12 @@ def train_one_epoch(
     optimizer,
     scaler,
     device,
+    variant_config: dict,
 ):
     model.train()
 
+    total_rec_loss = 0.0
+    total_anchor_loss = 0.0
     total_loss = 0.0
     total_examples = 0
 
@@ -111,7 +148,11 @@ def train_one_epoch(
                     )
                 )
 
-            loss = torch.stack(losses).mean()
+            recommendation_loss = torch.stack(losses).mean()
+
+            anchor_loss = model.anchor_loss()
+
+            loss = recommendation_loss + variant_config["anchor_lambda"] * anchor_loss
 
         scaler.scale(loss).backward()
 
@@ -128,11 +169,17 @@ def train_one_epoch(
 
         batch_size = len(item_seq)
 
+        total_rec_loss += recommendation_loss.item() * batch_size
+        total_anchor_loss += anchor_loss.item() * batch_size
         total_loss += loss.item() * batch_size
 
         total_examples += batch_size
 
-    return total_loss / total_examples
+    return {
+        "loss": (total_loss / total_examples),
+        "rec_loss": (total_rec_loss / total_examples),
+        "anchor_loss": (total_anchor_loss / total_examples),
+    }
 
 
 @torch.inference_mode()
@@ -221,6 +268,50 @@ def evaluate_teacher_forced(
 
 
 def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--variant",
+        choices=["A", "B", "C", "D"],
+        required=True,
+    )
+
+    parser.add_argument(
+        "--anchor-lambda",
+        type=float,
+        default=0.01,
+    )
+
+    args = parser.parse_args()
+
+    VARIANTS = {
+        "A": {
+            "embedding_mode": "scratch",
+            "tie_semantic_output": False,
+            "anchor_lambda": 0.0,
+        },
+        "B": {
+            "embedding_mode": "rq_init",
+            "tie_semantic_output": False,
+            "anchor_lambda": 0.0,
+        },
+        "C": {
+            "embedding_mode": "rq_init",
+            "tie_semantic_output": True,
+            "anchor_lambda": 0.0,
+        },
+        "D": {
+            "embedding_mode": "rq_anchor",
+            "tie_semantic_output": True,
+            "anchor_lambda": args.anchor_lambda,
+        },
+    }
+
+    variant_config = VARIANTS[args.variant]
+
+    print("Experiment variant:", args.variant)
+    print(variant_config)
+
     CHECKPOINT_DIR.mkdir(exist_ok=True)
     set_seed(CONFIG["seed"])
 
@@ -266,6 +357,21 @@ def main():
         vocab_sizes,
     )
 
+    rq_codebooks = load_rq_codebooks(RQ_CHECKPOINT)
+
+    if args.variant == "A":
+        rq_codebooks_for_model = None
+    else:
+        rq_codebooks_for_model = rq_codebooks
+
+    for i, cb in enumerate(rq_codebooks):
+        print(
+            f"RQ codebook {i}:",
+            tuple(cb.shape),
+            "mean norm=",
+            cb.norm(dim=1).mean().item(),
+        )
+
     # ============================================================
     # DATASET
     # ============================================================
@@ -301,6 +407,9 @@ def main():
         n_encoder_layers=CONFIG["n_encoder_layers"],
         n_decoder_layers=CONFIG["n_decoder_layers"],
         dropout=CONFIG["dropout"],
+        embedding_mode=variant_config["embedding_mode"],
+        tie_semantic_output=variant_config["tie_semantic_output"],
+        rq_codebooks=(rq_codebooks_for_model),
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -344,12 +453,13 @@ def main():
         CONFIG["epochs"] + 1,
     ):
         epoch_started = time.perf_counter()
-        train_loss = train_one_epoch(
+        losses = train_one_epoch(
             model,
             train_loader,
             optimizer,
             scaler,
             device,
+            variant_config,
         )
 
         val = evaluate_teacher_forced(
@@ -361,7 +471,7 @@ def main():
 
         print(
             f"Epoch {epoch:02d} | "
-            f"train={train_loss:.4f} | "
+            f"train={losses["loss"]:.4f} | "
             f"val={val['loss']:.4f} | "
             f"acc=" + "/".join(f"{x:.3f}" for x in val["accuracy"])
         )
@@ -371,16 +481,21 @@ def main():
             best_epoch = epoch
             patience_counter = 0
 
+            CHECKPOINT_PATH = CHECKPOINT_DIR / f"genrec_content_{args.variant}_best.pt"
+
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
                     "config": CONFIG,
+                    "variant": args.variant,
+                    "variant_config": variant_config,
                     "vocab_sizes": vocab_sizes,
                     "epoch": epoch,
                     "val_loss": best_loss,
+                    "semantic_drift": model.semantic_drift(),
                     "history_file": str(history_path),
                 },
-                CHECKPOINT_DIR / "genrec_content_best.pt",
+                CHECKPOINT_PATH,
             )
 
             print("  Saved best checkpoint")
@@ -391,7 +506,7 @@ def main():
         history["epochs"].append(
             {
                 "epoch": epoch,
-                "train_loss": train_loss,
+                "train_loss": losses["loss"],
                 "learning_rate": optimizer.param_groups[0]["lr"],
                 "duration_seconds": time.perf_counter() - epoch_started,
                 "valid_metrics": val,
